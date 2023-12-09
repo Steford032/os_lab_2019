@@ -11,15 +11,24 @@
 #include <sys/wait.h>
 
 #include <getopt.h>
+#include <signal.h>
 
 #include "find_min_max.h"
 #include "utils.h"
+
+volatile sig_atomic_t timeout_expired = 0;
+
+void kill_children(int sig) {
+    timeout_expired = 1;
+    printf("Timeout expired, sending SIGKILL to child processes.\n");
+}
 
 int main(int argc, char **argv) {
   int seed = -1;
   int array_size = -1;
   int pnum = -1;
   bool with_files = false;
+  int timeout = -1;
 
   while (true) {
     int current_optind = optind ? optind : 1;
@@ -28,6 +37,7 @@ int main(int argc, char **argv) {
                                       {"array_size", required_argument, 0, 0},
                                       {"pnum", required_argument, 0, 0},
                                       {"by_files", no_argument, 0, 'f'},
+                                      {"timeout", required_argument,0,'t'},
                                       {0, 0, 0, 0}};
 
     int option_index = 0;
@@ -71,6 +81,16 @@ int main(int argc, char **argv) {
         with_files = true;
         break;
 
+      case 't':
+            if (optarg) {
+              timeout = atoi(optarg);
+              if (timeout <= 0) {
+                printf("Timeout must be a positive number\n");
+                return 1;
+              }
+            }
+          break;  
+
       case '?':
         break;
 
@@ -113,15 +133,36 @@ int main(int argc, char **argv) {
             return 1; 
         } 
     } 
-  } 
+  }
+
+   pid_t *child_pids = malloc(sizeof(pid_t) * pnum); 
+
+    if (timeout > 0) {
+        signal(SIGALRM, kill_children);
+        struct itimerval timer;
+        timer.it_value.tv_sec = timeout / 1000;
+        timer.it_value.tv_usec = (timeout % 1000) * 1000;
+        timer.it_interval.tv_sec = 0;
+        timer.it_interval.tv_usec = 0;
+
+        setitimer(ITIMER_REAL, &timer, NULL); 
+    }
 
   for (int i = 0; i < pnum; i++) {
+    if (timeout_expired) {
+          break;
+        }
     pid_t child_pid = fork();
+    child_pids[i] = child_pid; 
     if (child_pid >= 0) {
       // successful fork
       
       active_child_processes += 1;
       if (child_pid == 0) {
+        if (timeout_expired) {
+          printf("Child process terminated due to timeout.\n");
+          exit(0);
+        }
         // child process
         struct  MinMax min_max;
         printf("Pipe was created\n");
@@ -134,13 +175,15 @@ int main(int argc, char **argv) {
         }
 
         if (with_files) {
-          fprintf(fl,"%d %d\n",min_max.min,min_max.max);
+          fprintf(fl, "%d %d\n", min_max.min, min_max.max);
         } else {
           // use pipe here
-          write(pipefd[i][1],&min_max.min,sizeof(int)); 
-          write(pipefd[i][1],&min_max.max,sizeof(int)); 
- 
+          write(pipefd[i][1], &min_max.min, sizeof(int));
+          write(pipefd[i][1], &min_max.max, sizeof(int));
+
           close(pipefd[i][1]);
+
+          close(pipefd[i][0]);
         }
         return 0;
       }
@@ -156,11 +199,27 @@ int main(int argc, char **argv) {
       fl=fopen("test.txt","r"); 
   }
 
-  while (active_child_processes > 0) {
-    // your code here
-    wait(NULL);
-    active_child_processes -= 1;
-  }
+
+while (active_child_processes > 0) {
+    int status;
+    if (timeout_expired) {
+        printf("Killing child processes due to timeout.\n");
+        for (int i = 0; i < pnum; i++) {
+            if (child_pids[i] > 0) {
+                kill(child_pids[i], SIGKILL);
+            }
+        }
+      fflush(NULL);
+      free(child_pids);
+      return 2;
+    }
+
+    pid_t done = waitpid(-1, &status, WNOHANG);
+    if (done > 0) {
+        active_child_processes -= 1;
+    }
+}
+
 
   struct MinMax min_max;
   min_max.min = INT_MAX;
@@ -206,5 +265,6 @@ int main(int argc, char **argv) {
   printf("Max: %d\n", min_max.max);
   printf("Elapsed time: %fms\n", elapsed_time);
   fflush(NULL);
+  free(child_pids);
   return 0;
 }
